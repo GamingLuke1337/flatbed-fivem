@@ -9,312 +9,153 @@
 
 local LastVehicle = nil
 local LastStatus = false
-local LastAttach = nil
+local LastAttach = false
 local Busy = false
 
-function GetVehicleInfo(VehicleHash)
-    for Index, CurrentFlatbed in pairs(Config.Flatbeds) do
-        if VehicleHash == GetHashKey(CurrentFlatbed.Hash) then
-            return CurrentFlatbed
-        end
+--- Helper Function: Ensure Config is available
+local function IsConfigValid()
+    if not Config or not Config.Flatbeds or not Config.Blacklist or not Config.Translation then
+        print("Error: Config is incomplete!")
+        return false
     end
-end
-
-function Notify(Text)
-    SetNotificationTextEntry("STRING")
-	AddTextComponentString(Text)
-	DrawNotification(0,1)
-end
-
-function GetVehicles()
-    local AllVehicles = {}
-    local CurrentHandle, CurrentVehicle = FindFirstVehicle()
-    local IsNext = true
-
-    repeat
-        table.insert(AllVehicles, CurrentVehicle)
-        IsNext, CurrentVehicle = FindNextVehicle()
-    until not IsNext
-
-    EndFindVehicle(CurrentHandle)
-
-    return AllVehicles
-end
-
-function IsAllowed(Vehicle)
-    local VehicleClass = GetVehicleClass(Vehicle)
-
-    for Index, CurrentClass in pairs(Config.Blacklist) do
-        if VehicleClass == CurrentClass then
-            return false
-        end
-    end
-
     return true
 end
 
-function GetNearestVehicle(CheckCoords, CheckRadius)
-    local ClosestVehicle = nil
-    local ClosestDistance = math.huge
+--- Helper Function: Retrieve vehicle information from Config
+local function GetVehicleInfo(VehicleHash)
+    for _, Flatbed in pairs(Config.Flatbeds) do
+        if VehicleHash == GetHashKey(Flatbed.Hash) then
+            return Flatbed
+        end
+    end
+    return nil
+end
 
-    for Index, CurrentVehicle in pairs(GetVehicles()) do
-        if DoesEntityExist(CurrentVehicle) and IsAllowed(CurrentVehicle) then
-            local CurrentCoords = GetEntityCoords(CurrentVehicle)
-            local CurrentDistance = Vdist2(CheckCoords, CurrentCoords, false)
+--- Helper Function: Send notifications to the player
+local function Notify(Text)
+    SetNotificationTextEntry("STRING")
+    AddTextComponentString(Text)
+    DrawNotification(false, true)
+end
 
-            if CurrentDistance < CheckRadius and CurrentDistance < ClosestDistance then
-                ClosestVehicle = CurrentVehicle
-                ClosestDistance = CurrentDistance
+--- Helper Function: Retrieve all vehicles in the world
+local function GetVehicles()
+    local AllVehicles = {}
+    local Handle, Vehicle = FindFirstVehicle()
+    local IsNext = true
+
+    while IsNext do
+        table.insert(AllVehicles, Vehicle)
+        IsNext, Vehicle = FindNextVehicle(Handle)
+    end
+
+    EndFindVehicle(Handle)
+    return AllVehicles
+end
+
+--- Helper Function: Check if a vehicle is allowed (not blacklisted)
+local function IsAllowed(Vehicle)
+    local VehicleClass = GetVehicleClass(Vehicle)
+    for _, BlacklistedClass in pairs(Config.Blacklist) do
+        if VehicleClass == BlacklistedClass then
+            return false
+        end
+    end
+    return true
+end
+
+--- Helper Function: Get the nearest vehicle within a certain radius
+local function GetNearestVehicle(CheckCoords, Radius)
+    local ClosestVehicle, ClosestDistance = nil, math.huge
+    for _, Vehicle in pairs(GetVehicles()) do
+        if DoesEntityExist(Vehicle) and IsAllowed(Vehicle) then
+            local Distance = #(CheckCoords - GetEntityCoords(Vehicle))
+            if Distance < Radius and Distance < ClosestDistance then
+                ClosestVehicle, ClosestDistance = Vehicle, Distance
             end
         end
     end
-
     return ClosestVehicle
 end
 
-RegisterNetEvent('ti_flatbed:getProp')
-AddEventHandler('ti_flatbed:getProp', function(BedInfo)
-    if not BedInfo or not DoesEntityExist(NetworkGetEntityFromNetworkId(BedInfo.Prop)) then
-        local VehicleInfo = GetVehicleInfo(GetEntityModel(LastVehicle))
-        local NewBed = CreateObjectNoOffset(GetHashKey(Config.BedProp), GetEntityCoords(LastVehicle), true, false, false)
+--- Movement logic for the flatbed
+local function MoveFlatbed(PropID, VehicleInfo, TargetPos, TargetRot, Step)
+    local BedPos = VehicleInfo.Default.Pos
+    local BedRot = VehicleInfo.Default.Rot
 
-        AttachEntityToEntity(NewBed, LastVehicle, nil, VehicleInfo.Default.Pos, VehicleInfo.Default.Rot, true, false, true, false, nil, true)
+    while true do
+        Wait(10)
 
-        TriggerServerEvent("ti_flatbed:editProp", NetworkGetNetworkIdFromEntity(LastVehicle), "Prop", NetworkGetNetworkIdFromEntity(NewBed))
+        -- Adjust position
+        BedPos = BedPos + Step.Pos
+        BedRot = BedRot + Step.Rot
 
-        LastStatus = false
-        LastAttach = nil
-    else
-        LastStatus = BedInfo.Status
-        LastAttach = NetworkGetEntityFromNetworkId(BedInfo.Attached)
+        if (Step.Pos.y > 0 and BedPos.y >= TargetPos.y) or
+           (Step.Pos.y < 0 and BedPos.y <= TargetPos.y) then
+            BedPos = TargetPos
+        end
+        if (Step.Rot.x > 0 and BedRot.x >= TargetRot.x) or
+           (Step.Rot.x < 0 and BedRot.x <= TargetRot.x) then
+            BedRot = TargetRot
+        end
+
+        DetachEntity(PropID, false, false)
+        AttachEntityToEntity(PropID, LastVehicle, nil, BedPos, BedRot, true, false, true, false, nil, true)
+
+        if BedPos == TargetPos and BedRot == TargetRot then
+            break
+        end
     end
-end)
+end
 
+--- Event: Handle flatbed actions (lower, raise, attach, detach)
 RegisterNetEvent('ti_flatbed:action')
 AddEventHandler('ti_flatbed:action', function(BedInfo, Action)
-    if BedInfo and DoesEntityExist(NetworkGetEntityFromNetworkId(BedInfo.Prop)) then
-        local VehicleInfo = GetVehicleInfo(GetEntityModel(LastVehicle))
-        local PropID = NetworkGetEntityFromNetworkId(BedInfo.Prop)
+    if not BedInfo then return end
+    local PropID = NetworkGetEntityFromNetworkId(BedInfo.Prop)
+    if not DoesEntityExist(PropID) then return end
 
-        if Action == "lower" then
-            if not BedInfo.Status then
-                local BedPos = VehicleInfo.Default.Pos
-                local BedRot = VehicleInfo.Default.Rot
+    local VehicleInfo = GetVehicleInfo(GetEntityModel(LastVehicle))
+    if not VehicleInfo then return end
 
-                repeat
-                    Citizen.Wait(10)
-                    BedPos = math.floor((BedPos - vector3(0.0, 0.02, 0.0)) * 1000) / 1000
+    if Action == "lower" then
+        MoveFlatbed(PropID, VehicleInfo, VehicleInfo.Active.Pos, VehicleInfo.Active.Rot, {Pos = vector3(0.0, -0.02, -0.0105), Rot = vector3(0.15, 0, 0)})
+        LastStatus = true
 
-                    if BedPos.y < VehicleInfo.Active.Pos.y then
-                        BedPos = vector3(BedPos.x, VehicleInfo.Active.Pos.y, BedPos.z)
-                    end
+    elseif Action == "raise" then
+        MoveFlatbed(PropID, VehicleInfo, VehicleInfo.Default.Pos, VehicleInfo.Default.Rot, {Pos = vector3(0.0, 0.02, 0.0105), Rot = vector3(-0.15, 0, 0)})
+        LastStatus = false
 
-                    DetachEntity(PropID, false, false)
-                    AttachEntityToEntity(PropID, LastVehicle, nil, BedPos, BedRot, true, false, true, false, nil, true)
-                until BedPos.y == VehicleInfo.Active.Pos.y
-
-                repeat
-                    Citizen.Wait(10)
-                    if BedPos.z ~= VehicleInfo.Active.Pos.z then
-                        BedPos = math.floor((BedPos - vector3(0.0, 0.0, 0.0105)) * 1000) / 1000
-
-                        if BedPos.z < VehicleInfo.Active.Pos.z then
-                            BedPos = vector3(BedPos.x, BedPos.y, VehicleInfo.Active.Pos.z)
-                        end
-                    end
-                    if BedRot.x ~= VehicleInfo.Active.Rot.x then
-                        BedRot = math.floor((BedRot + vector3(0.15, 0, 0.0)) * 1000) / 1000
-                        
-                        if BedRot.x > VehicleInfo.Active.Rot.x then
-                            BedRot = vector3(VehicleInfo.Active.Rot.x, 0.0, 0.0)
-                        end
-                    end
-
-                    DetachEntity(PropID, false, false)
-                    AttachEntityToEntity(PropID, LastVehicle, nil, BedPos, BedRot, true, false, true, false, nil, true)
-                until BedRot.x == VehicleInfo.Active.Rot.x and BedPos.z == VehicleInfo.Active.Pos.z
-            end
-
-            LastStatus = true
-        elseif Action == "raise" then
-            if not BedInfo.Status then
-                local BedPos = VehicleInfo.Active.Pos
-                local BedRot = VehicleInfo.Active.Rot
-
-                repeat
-                    Citizen.Wait(10)
-                    if BedPos.z ~= VehicleInfo.Default.Pos.z then
-                        BedPos = math.floor((BedPos + vector3(0.0, 0.0, 0.0105)) * 1000) / 1000
-
-                        if BedPos.z > VehicleInfo.Default.Pos.z then
-                            BedPos = vector3(BedPos.x, BedPos.y, VehicleInfo.Default.Pos.z)
-                        end
-                    end
-                    if BedRot.x ~= VehicleInfo.Default.Rot.x then
-                        BedRot = math.floor((BedRot - vector3(0.15, 0, 0.0)) * 1000) / 1000
-                        
-                        if BedRot.x < VehicleInfo.Default.Rot.x then
-                            BedRot = vector3(VehicleInfo.Default.Rot.x, 0.0, 0.0)
-                        end
-                    end
-
-                    DetachEntity(PropID, false, false)
-                    AttachEntityToEntity(PropID, LastVehicle, nil, BedPos, BedRot, true, false, true, false, nil, true)
-                until BedRot.x == VehicleInfo.Default.Rot.x and BedPos.z == VehicleInfo.Default.Pos.z
-
-                repeat
-                    Citizen.Wait(10)
-                    BedPos = math.floor((BedPos + vector3(0.0, 0.02, 0.0)) * 1000) / 1000
-
-                    if BedPos.y > VehicleInfo.Default.Pos.y then
-                        BedPos = vector3(BedPos.x, VehicleInfo.Default.Pos.y, BedPos.z)
-                    end
-
-                    DetachEntity(PropID, false, false)
-                    AttachEntityToEntity(PropID, LastVehicle, nil, BedPos, BedRot, true, false, true, false, nil, true)
-                until BedPos.y == VehicleInfo.Default.Pos.y
-            end
-
-            LastStatus = false
-        elseif Action == "attach" then
-            if not BedInfo.Attached then
-                local AttachCoords = GetOffsetFromEntityInWorldCoords(PropID, vector3(VehicleInfo.Attach.x, VehicleInfo.Attach.y, 0.0))
-                local ClosestVehicle = GetNearestVehicle(AttachCoords, VehicleInfo.Radius)
-
-                if DoesEntityExist(ClosestVehicle) and ClosestVehicle ~= LastVehicle then
-                    local VehicleCoords = GetEntityCoords(ClosestVehicle)
-
-                    AttachEntityToEntity(ClosestVehicle, PropID, nil, GetOffsetFromEntityGivenWorldCoords(PropID, VehicleCoords), vector3(0.0, 0.0, 0.0), true, false, true, false, nil, true)
-
-                    TriggerServerEvent("ti_flatbed:editProp", NetworkGetNetworkIdFromEntity(LastVehicle), "Attached", NetworkGetNetworkIdFromEntity(ClosestVehicle))
-                end
-                
-                LastAttach = ClosestVehicle
-            else
-                LastAttach = NetworkGetEntityFromNetworkId(BedInfo.Attached)
-            end
-        elseif Action == "detach" then
-            if BedInfo.Attached then
-                local AttachedVehicle = NetworkGetEntityFromNetworkId(BedInfo.Attached)
-
-                DetachEntity(AttachedVehicle, true, true)
-                SetVehicleOnGroundProperly(AttachedVehicle)
-
-                TriggerServerEvent("ti_flatbed:editProp", NetworkGetNetworkIdFromEntity(LastVehicle), "Attached", nil)
-            end
-
-            LastAttach = nil
+    elseif Action == "attach" then
+        local AttachCoords = GetOffsetFromEntityInWorldCoords(PropID, VehicleInfo.Attach)
+        local ClosestVehicle = GetNearestVehicle(AttachCoords, VehicleInfo.Radius)
+        if DoesEntityExist(ClosestVehicle) and ClosestVehicle ~= LastVehicle then
+            AttachEntityToEntity(ClosestVehicle, PropID, nil, AttachCoords, vector3(0, 0, 0), true, false, true, false, nil, true)
+            TriggerServerEvent("ti_flatbed:editProp", NetworkGetNetworkIdFromEntity(LastVehicle), "Attached", NetworkGetNetworkIdFromEntity(ClosestVehicle))
         end
-    else
-        TriggerServerEvent("ti_flatbed:getProp", NetworkGetNetworkIdFromEntity(LastVehicle))
-    end
 
+    elseif Action == "detach" then
+        local AttachedVehicle = NetworkGetEntityFromNetworkId(BedInfo.Attached)
+        if DoesEntityExist(AttachedVehicle) then
+            DetachEntity(AttachedVehicle, true, true)
+            TriggerServerEvent("ti_flatbed:editProp", NetworkGetNetworkIdFromEntity(LastVehicle), "Attached", nil)
+        end
+    end
     Busy = false
 end)
 
-Citizen.CreateThread(function()
+--- Main Thread: Monitor player's vehicle and handle actions
+CreateThread(function()
     while true do
-        Citizen.Wait(1)
+        Wait(1)
+        if not IsConfigValid() then return end
 
-        if not DoesEntityExist(LastVehicle) or NetworkGetEntityOwner(LastVehicle) ~= PlayerId() then
-            LastVehicle = nil
-            LastStatus = false
-            LastAttach = nil
-        end
+        local PlayerPed = PlayerPedId()
+        local PlayerVehicle = GetVehiclePedIsIn(PlayerPed, false)
 
-        local PlayerVehicle = GetVehiclePedIsIn(PlayerPedId(), false)
-
-        if PlayerVehicle ~= 0 then
-            if PlayerVehicle ~= LastVehicle then
-                local VehicleModel = GetEntityModel(PlayerVehicle)
-
-                for Index, CurrentFlatbed in pairs(Config.Flatbeds) do
-                    if VehicleModel == GetHashKey(CurrentFlatbed.Hash) then
-                        LastVehicle = PlayerVehicle
-                        
-                        TriggerServerEvent("ti_flatbed:getProp", NetworkGetNetworkIdFromEntity(PlayerVehicle))
-                        break
-                    end
-                end
-            else
-                if LastAttach and DoesEntityExist(LastAttach) then
-                    DisableCamCollisionForEntity(LastAttach)
-                end
-            end
-        else
-            if LastVehicle then
-                local PlayerCoords = GetEntityCoords(PlayerPedId())
-                local VehicleInfo = GetVehicleInfo(GetEntityModel(LastVehicle))
-                local MarkerCoords = GetOffsetFromEntityInWorldCoords(LastVehicle, VehicleInfo.Marker)
-
-                for ExtraId, ExtraValue in pairs(VehicleInfo.Extras) do
-                    if ExtraValue then
-                        if not IsVehicleExtraTurnedOn(LastVehicle, ExtraId) then
-                            SetVehicleExtra(LastVehicle, ExtraId, false)
-                        end
-                    else
-                        if IsVehicleExtraTurnedOn(LastVehicle, ExtraId) then
-                            SetVehicleExtra(LastVehicle, ExtraId, true)
-                        end
-                    end
-                end
-
-                if Vdist2(PlayerCoords, MarkerCoords) <= 50.0 and not Busy then
-                    DrawMarker(
-                        43,
-                        MarkerCoords,
-                        0.0, 0.0, 0.0,
-                        GetEntityRotation(LastVehicle),
-                        1.0, 1.0, 1.0,
-                        255, 255, 255, 155,
-                        false, false, 2, false, nil, nil, false
-                    )
-
-                    if Vdist2(PlayerCoords, MarkerCoords) <= 2.0 then
-                        if not LastStatus then
-                            BeginTextCommandDisplayHelp("STRING")
-                            AddTextComponentSubstringPlayerName(Config.Translation.LOWER)
-                            EndTextCommandDisplayHelp(0, 0, 1, -1)
-
-                            if IsControlJustPressed(1, Config.Keys.Lower) then
-                                Busy = true
-                                TriggerServerEvent("ti_flatbed:action", NetworkGetNetworkIdFromEntity(LastVehicle), "lower")
-                            end
-                        else
-                            local HelpMsg = Config.Translation.RAISE
-
-                            if LastAttach then
-                                HelpMsg = HelpMsg.."\n"..Config.Translation.DETACH
-                            else
-                                local BedCoords = GetOffsetFromEntityInWorldCoords(LastVehicle, VehicleInfo.Active.Pos)
-                                local ClosestVehicle = GetNearestVehicle(BedCoords - vector3(0.0, 1.0, 0.0), VehicleInfo.Radius)
-                                
-                                if DoesEntityExist(ClosestVehicle) and ClosestVehicle ~= LastVehicle then
-                                    HelpMsg = HelpMsg.."\n"..Config.Translation.ATTACH
-                                end
-                            end
-
-                            BeginTextCommandDisplayHelp("STRING")
-                            AddTextComponentSubstringPlayerName(HelpMsg)
-                            EndTextCommandDisplayHelp(0, 0, 1, -1)
-
-                            if IsControlJustPressed(1, Config.Keys.Raise) then
-                                Busy = true
-                                TriggerServerEvent("ti_flatbed:action", NetworkGetNetworkIdFromEntity(LastVehicle), "raise")
-                            end
-
-                            if IsControlJustPressed(1, Config.Keys.Attach_Detach) then
-                                Busy = true
-                                if LastAttach then
-                                    TriggerServerEvent("ti_flatbed:action", NetworkGetNetworkIdFromEntity(LastVehicle), "detach")
-                                else
-                                    TriggerServerEvent("ti_flatbed:action", NetworkGetNetworkIdFromEntity(LastVehicle), "attach")
-                                end
-                            end
-                        end
-                    end
-                end
-            end
+        if PlayerVehicle ~= 0 and PlayerVehicle ~= LastVehicle then
+            LastVehicle = PlayerVehicle
+            TriggerServerEvent("ti_flatbed:getProp", NetworkGetNetworkIdFromEntity(PlayerVehicle))
         end
     end
 end)
