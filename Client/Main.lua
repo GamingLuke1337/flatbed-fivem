@@ -9,7 +9,7 @@
 
 local LastVehicle = nil
 local LastStatus = false
-local LastAttach = false
+local LastAttach = nil
 local Busy = false
 
 --- Helper Function: Ensure Config is available
